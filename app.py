@@ -28,25 +28,21 @@ SATELLITES = {
     }
 }
 
-STATIONS = {
-    "GS-01": 20,
-    "GS-02": 15,
-    "GS-03": 10
-}
+STATIONS = {"GS-01": 20, "GS-02": 15, "GS-03": 10}
 
 PASSES = [
-    ("P01", "SAT-01", "GS-01", 0, 10, .95),
-    ("P02", "SAT-02", "GS-02", 5, 15, .90),
-    ("P03", "SAT-03", "GS-03", 10, 20, .85),
-    ("P04", "SAT-01", "GS-02", 15, 25, .80),
-    ("P05", "SAT-02", "GS-01", 20, 30, .95),
-    ("P06", "SAT-03", "GS-02", 25, 35, .75),
-    ("P07", "SAT-01", "GS-03", 30, 40, .90),
-    ("P08", "SAT-02", "GS-03", 35, 45, .85),
-    ("P09", "SAT-03", "GS-01", 40, 50, .95),
-    ("P10", "SAT-01", "GS-01", 45, 55, .70),
-    ("P11", "SAT-02", "GS-02", 50, 60, .90),
-    ("P12", "SAT-03", "GS-03", 55, 65, .80)
+    ("P01","SAT-01","GS-01",0,10,.95),
+    ("P02","SAT-02","GS-02",5,15,.90),
+    ("P03","SAT-03","GS-03",10,20,.85),
+    ("P04","SAT-01","GS-02",15,25,.80),
+    ("P05","SAT-02","GS-01",20,30,.95),
+    ("P06","SAT-03","GS-02",25,35,.75),
+    ("P07","SAT-01","GS-03",30,40,.90),
+    ("P08","SAT-02","GS-03",35,45,.85),
+    ("P09","SAT-03","GS-01",40,50,.95),
+    ("P10","SAT-01","GS-01",45,55,.70),
+    ("P11","SAT-02","GS-02",50,60,.90),
+    ("P12","SAT-03","GS-03",55,65,.80)
 ]
 
 TASKS = [
@@ -70,41 +66,32 @@ TASKS = [
     ("T18","IMAGING",6,6,18,65,11)
 ]
 
+
 # ---------------- OPTIMIZER ----------------
 
-def optimize_mission(scenario, outage_station, degradation):
+def optimize_mission(scenario, outage_station, quality_factor):
     model = cp_model.CpModel()
-
-    # Scenario changes are applied to the actual candidate passes.
-    available_passes = []
-
-    for pid, sat, station, ps, pe, quality in PASSES:
-        if scenario == "Ground Station Outage":
-            if station == outage_station:
-                continue
-
-        if scenario == "Link Degradation":
-            quality *= degradation
-
-        rate = STATIONS[station] * quality
-
-        # Round transmission duration UP to whole minutes.
-        available_passes.append({
-            "pass_id": pid,
-            "satellite": sat,
-            "station": station,
-            "start": ps,
-            "end": pe,
-            "quality": quality,
-            "rate": rate
-        })
-
     candidates = []
     task_choices = {t[0]: [] for t in TASKS}
     sat_intervals = {s: [] for s in SATELLITES}
     station_intervals = {s: [] for s in STATIONS}
-    storage_intervals = {s: [] for s in SATELLITES}
     power_terms = {s: [] for s in SATELLITES}
+    storage_items = {s: [] for s in SATELLITES}
+
+    # Apply the selected scenario to actual visibility passes.
+    usable_passes = []
+    for pid, sat, station, ps, pe, quality in PASSES:
+        if scenario == "Ground Station Outage" and station == outage_station:
+            continue
+
+        if scenario == "Link Degradation":
+            quality *= quality_factor
+
+        rate = STATIONS[station] * quality
+        usable_passes.append({
+            "id": pid, "sat": sat, "station": station,
+            "start": ps, "end": pe, "quality": quality, "rate": rate
+        })
 
     for task in TASKS:
         tid, kind, priority, duration, data, deadline, power = task
@@ -113,8 +100,8 @@ def optimize_mission(scenario, outage_station, degradation):
             if kind not in sd["capabilities"]:
                 continue
 
-            for p in available_passes:
-                if p["satellite"] != sat:
+            for p in usable_passes:
+                if p["sat"] != sat:
                     continue
 
                 tx_duration = max(
@@ -128,231 +115,169 @@ def optimize_mission(scenario, outage_station, degradation):
                     continue
 
                 i = len(candidates)
-                present = model.NewBoolVar(f"choose_{i}")
+                chosen = model.NewBoolVar(f"chosen_{i}")
 
-                start = model.NewIntVar(
-                    0, deadline - duration, f"start_{i}"
-                )
-                end = model.NewIntVar(
-                    duration, deadline, f"end_{i}"
-                )
+                start = model.NewIntVar(0, deadline - duration, f"start_{i}")
+                end = model.NewIntVar(duration, deadline, f"end_{i}")
                 model.Add(end == start + duration)
 
                 tx_start = model.NewIntVar(
-                    p["start"], p["end"] - tx_duration,
-                    f"tx_start_{i}"
+                    p["start"], p["end"] - tx_duration, f"txstart_{i}"
                 )
                 tx_end = model.NewIntVar(
-                    p["start"] + tx_duration, p["end"],
-                    f"tx_end_{i}"
+                    p["start"] + tx_duration, p["end"], f"txend_{i}"
                 )
                 model.Add(tx_end == tx_start + tx_duration)
-
-                # A task must finish before its data is transmitted.
-                model.Add(end <= tx_start).OnlyEnforceIf(present)
+                model.Add(end <= tx_start).OnlyEnforceIf(chosen)
 
                 exec_interval = model.NewOptionalIntervalVar(
-                    start, duration, end, present, f"exec_{i}"
+                    start, duration, end, chosen, f"exec_{i}"
                 )
                 tx_interval = model.NewOptionalIntervalVar(
-                    tx_start, tx_duration, tx_end, present,
-                    f"transmit_{i}"
+                    tx_start, tx_duration, tx_end, chosen, f"tx_{i}"
                 )
 
-                sat_intervals[sat].extend(
-                    [exec_interval, tx_interval]
-                )
+                sat_intervals[sat] += [exec_interval, tx_interval]
                 station_intervals[p["station"]].append(tx_interval)
-                power_terms[sat].append(present * power)
-                task_choices[tid].append(present)
+                power_terms[sat].append(chosen * power)
+                task_choices[tid].append(chosen)
 
-                # Task data occupies storage from execution end
-                # until its downlink finishes.
-                storage_duration = model.NewIntVar(
+                # Storage is occupied between task completion and downlink.
+                stored_duration = model.NewIntVar(
                     0, deadline, f"stored_duration_{i}"
                 )
-                model.Add(
-                    storage_duration == tx_end - end
-                ).OnlyEnforceIf(present)
+                model.Add(stored_duration == tx_end - end).OnlyEnforceIf(chosen)
 
-                storage_interval = model.NewOptionalIntervalVar(
-                    end, storage_duration, tx_end, present,
-                    f"storage_{i}"
+                stored_interval = model.NewOptionalIntervalVar(
+                    end, stored_duration, tx_end, chosen, f"storage_{i}"
                 )
-                storage_intervals[sat].append(
-                    (storage_interval, data)
-                )
+                storage_items[sat].append((stored_interval, data))
 
                 candidates.append({
-                    "index": i,
-                    "task": task,
-                    "satellite": sat,
-                    "pass": p,
-                    "present": present,
-                    "start": start,
-                    "end": end,
-                    "tx_start": tx_start,
-                    "tx_end": tx_end,
-                    "tx_duration": tx_duration,
-                    "exec_interval": exec_interval,
-                    "tx_interval": tx_interval
+                    "chosen": chosen, "task": task, "sat": sat,
+                    "pass": p, "start": start, "end": end,
+                    "tx_start": tx_start, "tx_end": tx_end,
+                    "tx_duration": tx_duration
                 })
 
-    # Each task can be selected at most once.
-    for tid, choices in task_choices.items():
+    for choices in task_choices.values():
         if choices:
             model.Add(sum(choices) <= 1)
 
-    # Satellite activity cannot overlap.
-    for sat in SATELLITES:
+    for sat, sd in SATELLITES.items():
         if sat_intervals[sat]:
             model.AddNoOverlap(sat_intervals[sat])
 
-        model.Add(
-            sum(power_terms[sat]) <= SATELLITES[sat]["power"]
-        )
+        if power_terms[sat]:
+            model.Add(sum(power_terms[sat]) <= sd["power"])
 
-        # Conservative storage constraint: initial occupied storage
-        # is reserved throughout the modeled horizon.
-        items = storage_intervals[sat]
-        if items:
-            horizon = max(t[5] for t in TASKS)
-            baseline = model.NewIntervalVar(
-                0, horizon, horizon, f"initial_storage_{sat}"
-            )
-            all_intervals = [baseline]
-            all_demands = [SATELLITES[sat]["initial"]]
+        # Reserve initial occupied storage for the entire planning horizon.
+        baseline = model.NewIntervalVar(0, 65, 65, f"initial_{sat}")
+        intervals = [baseline]
+        demands = [sd["initial"]]
 
-            for interval, data in items:
-                all_intervals.append(interval)
-                all_demands.append(data)
+        for interval, data in storage_items[sat]:
+            intervals.append(interval)
+            demands.append(data)
 
-            model.AddCumulative(
-                all_intervals,
-                all_demands,
-                SATELLITES[sat]["storage"]
-            )
+        model.AddCumulative(intervals, demands, sd["storage"])
 
-    # A ground station can serve only one downlink at a time.
-    for station in STATIONS:
-        if station_intervals[station]:
-            model.AddNoOverlap(station_intervals[station])
+    for station, intervals in station_intervals.items():
+        if intervals:
+            model.AddNoOverlap(intervals)
 
-    # Maximize total priority of successfully scheduled tasks.
-    model.Maximize(
-        sum(
-            c["present"] * (c["task"][2] * 100 + 1)
-            for c in candidates
-        )
-    )
+    model.Maximize(sum(
+        c["chosen"] * (c["task"][2] * 100 + 1)
+        for c in candidates
+    ))
 
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = 15
     status = solver.Solve(model)
 
-    status_name = solver.StatusName(status)
-
     if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        return status_name, pd.DataFrame(), 0, len(candidates)
+        return solver.StatusName(status), pd.DataFrame(), 0, len(candidates)
 
     rows = []
-
     for c in candidates:
-        if solver.Value(c["present"]) != 1:
+        if solver.Value(c["chosen"]) == 0:
             continue
 
-        task = c["task"]
-        p = c["pass"]
-
+        t, p = c["task"], c["pass"]
         rows.append({
-            "Task": task[0],
-            "Type": task[1],
-            "Priority": task[2],
-            "Satellite": c["satellite"],
-            "Station": p["station"],
-            "Pass": p["pass_id"],
+            "Task": t[0], "Type": t[1], "Priority": t[2],
+            "Satellite": c["sat"], "Station": p["station"],
+            "Pass": p["id"],
             "Start": solver.Value(c["start"]),
             "End": solver.Value(c["end"]),
             "Downlink Start": solver.Value(c["tx_start"]),
             "Downlink End": solver.Value(c["tx_end"]),
-            "Data MB": task[4],
-            "Link Quality": round(p["quality"], 2)
+            "Data MB": t[4], "Link Quality": round(p["quality"], 2)
         })
 
-    result = pd.DataFrame(rows).sort_values("Start")
+    result = pd.DataFrame(rows)
+    if not result.empty:
+        result = result.sort_values("Start").reset_index(drop=True)
+
     utility = int(result["Priority"].sum()) if not result.empty else 0
+    return solver.StatusName(status), result, utility, len(candidates)
 
-    return status_name, result, utility, len(candidates)
 
-
-# ---------------- INTERFACE ----------------
+# ---------------- STREAMLIT INTERFACE ----------------
 
 st.title("🛰️ Intelligent Satellite Mission Control")
-st.caption(
-    "Constraint-based scheduling prototype | Simulated orbital passes"
-)
+st.caption("Constraint-based scheduling prototype using simulated orbital passes")
 
 scenario = st.sidebar.selectbox(
     "Mission scenario",
-    [
-        "Normal Mission",
-        "Urgent Tasking",
-        "Ground Station Outage",
-        "Link Degradation"
-    ]
+    ["Normal Mission", "Ground Station Outage", "Link Degradation"]
 )
 
 outage_station = "GS-01"
-degradation = 0.5
+quality_factor = 0.5
 
 if scenario == "Ground Station Outage":
     outage_station = st.sidebar.selectbox(
-        "Station to disable", list(STATIONS.keys())
+        "Unavailable station", list(STATIONS.keys())
     )
 
 if scenario == "Link Degradation":
-    degradation = st.sidebar.slider(
-        "Link quality multiplier",
-        min_value=0.1,
-        max_value=0.9,
-        value=0.5,
-        step=0.1
+    quality_factor = st.sidebar.slider(
+        "Link quality multiplier", 0.1, 0.9, 0.5, 0.1
     )
 
-if scenario == "Urgent Tasking":
-    st.info(
-        "Urgent task priorities are not yet changed in this version. "
-        "This selection currently uses normal task priorities."
-    )
-
-run = st.sidebar.button("Run optimizer", type="primary")
-
-if "run_optimizer" not in st.session_state:
-    st.session_state.run_optimizer = True
-
-if run:
-    st.session_state.run_optimizer = True
-
-if st.session_state.run_optimizer:
-    with st.spinner("Optimizing task and downlink schedule..."):
+if st.sidebar.button("Run optimizer", type="primary"):
+    with st.spinner("Solving the scheduling problem..."):
         status, result, utility, candidate_count = optimize_mission(
-            scenario, outage_station, degradation
+            scenario, outage_station, quality_factor
         )
 
-    st.session_state.result = result
-    st.session_state.status = status
-    st.session_state.utility = utility
-    st.session_state.candidate_count = candidate_count
-    st.session_state.scenario = scenario
-    st.session_state.run_optimizer = False
+    st.session_state["result"] = result
+    st.session_state["status"] = status
+    st.session_state["utility"] = utility
+    st.session_state["candidate_count"] = candidate_count
+    st.session_state["scenario"] = scenario
+    st.session_state["station"] = outage_station
+    st.session_state["factor"] = quality_factor
 
-result = st.session_state.get("result", pd.DataFrame())
-status = st.session_state.get("status", "Not run")
-utility = st.session_state.get("utility", 0)
-candidate_count = st.session_state.get("candidate_count", 0)
+if "result" not in st.session_state:
+    with st.spinner("Running initial mission optimization..."):
+        status, result, utility, candidate_count = optimize_mission(
+            "Normal Mission", outage_station, quality_factor
+        )
+    st.session_state.update({
+        "result": result, "status": status, "utility": utility,
+        "candidate_count": candidate_count,
+        "scenario": "Normal Mission",
+        "station": outage_station, "factor": quality_factor
+    })
 
-if st.session_state.get("scenario") != scenario:
-    st.warning("Scenario changed. Click Run optimizer to calculate new results.")
+result = st.session_state["result"]
+status = st.session_state["status"]
+utility = st.session_state["utility"]
+
+if st.session_state["scenario"] != scenario:
+    st.warning("Scenario changed. Click Run optimizer to calculate the new schedule.")
 
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("Scheduled Tasks", len(result), f"of {len(TASKS)}")
@@ -360,49 +285,62 @@ c2.metric("Unscheduled Tasks", len(TASKS) - len(result))
 c3.metric("Mission Utility", utility)
 c4.metric("Solver Status", status)
 
-st.caption(f"Candidate combinations evaluated: {candidate_count}")
+st.caption(
+    f"Candidate combinations evaluated: {st.session_state['candidate_count']}"
+)
 
 if scenario == "Ground Station Outage":
-    st.warning(f"{outage_station} is excluded from all candidate downlinks.")
+    st.warning(f"{outage_station} is removed from the candidate visibility passes.")
 elif scenario == "Link Degradation":
     st.warning(
-        f"Effective link quality is multiplied by {degradation:.1f}. "
-        "Lower data rates may make passes infeasible."
+        f"Effective link quality is multiplied by {quality_factor:.1f}. "
+        "Reduced rates can make some downlinks infeasible."
     )
 
-if not result.empty:
+if result.empty:
+    st.info("No feasible tasks were selected for this scenario.")
+else:
     st.subheader("Satellite Task Timeline")
-    fig = px.timeline(
-        result,
-        x_start="Start",
-        x_end="End",
+
+    # Numeric bar chart: avoids Plotly interpreting minutes as timestamps.
+    task_plot = result.copy()
+    task_plot["Duration"] = task_plot["End"] - task_plot["Start"]
+
+    fig = px.bar(
+        task_plot,
+        x="Duration",
         y="Satellite",
+        base="Start",
         color="Type",
-        hover_data=["Task", "Priority", "Station"]
+        orientation="h",
+        hover_data=["Task", "Priority", "Station", "Start", "End"]
     )
     fig.update_layout(
         xaxis_title="Mission time (minutes)",
-        yaxis_title="Satellite"
+        yaxis_title="Satellite",
+        xaxis_type="linear"
     )
     st.plotly_chart(fig, use_container_width=True)
 
     st.subheader("Ground-Station Downlink Schedule")
-    downlinks = result.rename(columns={
-        "Downlink Start": "tx_start",
-        "Downlink End": "tx_end"
-    })
+    downlink_plot = result.copy()
+    downlink_plot["Transmission Duration"] = (
+        downlink_plot["Downlink End"] - downlink_plot["Downlink Start"]
+    )
 
-    fig2 = px.timeline(
-        downlinks,
-        x_start="tx_start",
-        x_end="tx_end",
+    fig2 = px.bar(
+        downlink_plot,
+        x="Transmission Duration",
         y="Station",
+        base="Downlink Start",
         color="Satellite",
+        orientation="h",
         hover_data=["Task", "Pass", "Link Quality"]
     )
     fig2.update_layout(
         xaxis_title="Mission time (minutes)",
-        yaxis_title="Ground station"
+        yaxis_title="Ground station",
+        xaxis_type="linear"
     )
     st.plotly_chart(fig2, use_container_width=True)
 
@@ -412,11 +350,51 @@ if not result.empty:
     skipped = sorted(set(t[0] for t in TASKS) - set(result["Task"]))
     st.write("Unscheduled tasks:", ", ".join(skipped) if skipped else "None")
 
-else:
-    st.info("No feasible schedule was returned. Try another scenario.")
+    # Basic consistency checks on the displayed schedule.
+    st.subheader("Schedule Validation")
+    checks = []
+
+    checks.append((
+        "No downlinks use failed station",
+        scenario != "Ground Station Outage"
+        or not (result["Station"] == outage_station).any()
+    ))
+
+    checks.append((
+        "No downlink exceeds its visibility pass",
+        all(
+            row["Downlink Start"] >= next(
+                p[3] for p in PASSES if p[0] == row["Pass"]
+            )
+            and row["Downlink End"] <= next(
+                p[4] for p in PASSES if p[0] == row["Pass"]
+            )
+            for _, row in result.iterrows()
+        )
+    ))
+
+    checks.append((
+        "Task completes before downlink",
+        (result["End"] <= result["Downlink Start"]).all()
+    ))
+
+    checks.append((
+        "No station transmission overlaps",
+        all(
+            all(
+                a["Downlink End"] <= b["Downlink Start"]
+                or b["Downlink End"] <= a["Downlink Start"]
+                for i, a in enumerate(group.to_dict("records"))
+                for b in group.to_dict("records")[i+1:]
+            )
+            for _, group in result.groupby("Station")
+        )
+    ))
+
+    for label, passed in checks:
+        st.write(("✅ " if passed else "❌ ") + label)
 
 st.caption(
-    "Research prototype using synthetic task and pass data. "
-    "Not connected to live satellite telemetry or real orbital ephemerides."
+    "Synthetic research prototype, not connected to live satellite telemetry. "
+    "Power and storage use simplified planning constraints."
 )
-
