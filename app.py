@@ -1,400 +1,747 @@
 
 import math
+import time
+from collections import defaultdict
+
 import pandas as pd
 import plotly.express as px
 import streamlit as st
 from ortools.sat.python import cp_model
 
+
+# ============================================================
+# PAGE CONFIGURATION
+# ============================================================
+
 st.set_page_config(
-    page_title="Satellite Mission Control",
+    page_title="Intelligent Satellite Scheduler",
     page_icon="🛰️",
-    layout="wide"
+    layout="wide",
 )
 
-# ---------------- MISSION DATA ----------------
+st.title("🛰️ Intelligent Satellite Communication & Task Scheduling")
+st.caption(
+    "CP-SAT constraint optimization vs. priority-based greedy scheduling. "
+    "All data are simulated, not live satellite telemetry."
+)
 
-SATELLITES = {
-    "SAT-01": {
-        "power": 100, "storage": 120, "initial": 20,
-        "capabilities": ["IMAGING", "COMMUNICATION"]
-    },
-    "SAT-02": {
-        "power": 100, "storage": 120, "initial": 15,
-        "capabilities": ["IMAGING"]
-    },
-    "SAT-03": {
-        "power": 100, "storage": 120, "initial": 10,
-        "capabilities": ["COMMUNICATION", "WEATHER"]
-    }
-}
 
-STATIONS = {"GS-01": 20, "GS-02": 15, "GS-03": 10}
+# ============================================================
+# SIMULATED INPUT DATA
+# Time is represented as minutes from the beginning of the mission.
+# Data sizes are MB; rates are MB/minute.
+# ============================================================
 
-PASSES = [
-    ("P01","SAT-01","GS-01",0,10,.95),
-    ("P02","SAT-02","GS-02",5,15,.90),
-    ("P03","SAT-03","GS-03",10,20,.85),
-    ("P04","SAT-01","GS-02",15,25,.80),
-    ("P05","SAT-02","GS-01",20,30,.95),
-    ("P06","SAT-03","GS-02",25,35,.75),
-    ("P07","SAT-01","GS-03",30,40,.90),
-    ("P08","SAT-02","GS-03",35,45,.85),
-    ("P09","SAT-03","GS-01",40,50,.95),
-    ("P10","SAT-01","GS-01",45,55,.70),
-    ("P11","SAT-02","GS-02",50,60,.90),
-    ("P12","SAT-03","GS-03",55,65,.80)
+def create_data():
+    satellites = pd.DataFrame([
+        {"satellite": "SAT-1"},
+        {"satellite": "SAT-2"},
+        {"satellite": "SAT-3"},
+    ])
+
+    stations = pd.DataFrame([
+        {"station": "GS-A"},
+        {"station": "GS-B"},
+        {"station": "GS-C"},
+    ])
+
+    passes = pd.DataFrame([
+        {"pass_id": "P01", "satellite": "SAT-1", "station": "GS-A",
+         "start": 0, "end": 20, "rate": 12},
+        {"pass_id": "P02", "satellite": "SAT-2", "station": "GS-B",
+         "start": 5, "end": 25, "rate": 10},
+        {"pass_id": "P03", "satellite": "SAT-3", "station": "GS-C",
+         "start": 10, "end": 30, "rate": 11},
+        {"pass_id": "P04", "satellite": "SAT-1", "station": "GS-B",
+         "start": 25, "end": 45, "rate": 12},
+        {"pass_id": "P05", "satellite": "SAT-2", "station": "GS-C",
+         "start": 30, "end": 50, "rate": 10},
+        {"pass_id": "P06", "satellite": "SAT-3", "station": "GS-A",
+         "start": 35, "end": 55, "rate": 11},
+        {"pass_id": "P07", "satellite": "SAT-1", "station": "GS-C",
+         "start": 55, "end": 75, "rate": 12},
+        {"pass_id": "P08", "satellite": "SAT-2", "station": "GS-A",
+         "start": 60, "end": 80, "rate": 10},
+        {"pass_id": "P09", "satellite": "SAT-3", "station": "GS-B",
+         "start": 65, "end": 85, "rate": 11},
+        {"pass_id": "P10", "satellite": "SAT-1", "station": "GS-A",
+         "start": 90, "end": 110, "rate": 12},
+        {"pass_id": "P11", "satellite": "SAT-2", "station": "GS-B",
+         "start": 95, "end": 115, "rate": 10},
+        {"pass_id": "P12", "satellite": "SAT-3", "station": "GS-C",
+         "start": 100, "end": 120, "rate": 11},
+    ])
+
+    task_rows = [
+        ("T01", "SAT-1", 10, 35, 100),
+        ("T02", "SAT-2", 8, 45, 90),
+        ("T03", "SAT-3", 9, 40, 100),
+        ("T04", "SAT-1", 7, 65, 120),
+        ("T05", "SAT-2", 6, 70, 100),
+        ("T06", "SAT-3", 8, 70, 110),
+        ("T07", "SAT-1", 5, 90, 80),
+        ("T08", "SAT-2", 9, 90, 120),
+        ("T09", "SAT-3", 7, 95, 90),
+        ("T10", "SAT-1", 8, 115, 100),
+        ("T11", "SAT-2", 5, 120, 80),
+        ("T12", "SAT-3", 6, 120, 90),
+        ("T13", "SAT-1", 4, 80, 70),
+        ("T14", "SAT-2", 7, 105, 90),
+        ("T15", "SAT-3", 5, 110, 80),
+        ("T16", "SAT-1", 9, 50, 110),
+        ("T17", "SAT-2", 4, 85, 70),
+        ("T18", "SAT-3", 8, 75, 100),
+    ]
+
+    tasks = pd.DataFrame(
+        task_rows,
+        columns=["task_id", "satellite", "priority", "deadline", "data_mb"],
+    )
+
+    return satellites, stations, passes, tasks
+
+
+# ============================================================
+# SCENARIO CONFIGURATION
+# Multiple Events applies BOTH disruptions to the same inputs:
+#   1. One ground station is unavailable.
+#   2. Link rate is reduced on all remaining eligible passes.
+# ============================================================
+
+SCENARIOS = [
+    "Normal Mission",
+    "Urgent Tasking",
+    "Ground Station Outage",
+    "Link Degradation",
+    "Multiple Events",
 ]
 
-TASKS = [
-    ("T01","IMAGING",10,5,25,20,15),
-    ("T02","COMMUNICATION",8,4,15,25,10),
-    ("T03","WEATHER",9,6,20,30,12),
-    ("T04","IMAGING",7,5,30,35,18),
-    ("T05","COMMUNICATION",6,3,10,40,8),
-    ("T06","IMAGING",10,7,35,45,20),
-    ("T07","WEATHER",5,4,12,50,9),
-    ("T08","COMMUNICATION",8,5,18,55,11),
-    ("T09","IMAGING",9,6,28,60,16),
-    ("T10","WEATHER",7,3,10,65,7),
-    ("T11","COMMUNICATION",6,4,16,55,10),
-    ("T12","IMAGING",8,5,22,60,14),
-    ("T13","WEATHER",9,4,14,50,9),
-    ("T14","COMMUNICATION",7,6,24,65,13),
-    ("T15","IMAGING",5,3,12,40,8),
-    ("T16","WEATHER",10,5,26,60,15),
-    ("T17","COMMUNICATION",9,4,20,45,12),
-    ("T18","IMAGING",6,6,18,65,11)
-]
+
+def apply_scenario(passes, tasks, scenario, outage_station, rate_factor):
+    adjusted_passes = passes.copy()
+    adjusted_tasks = tasks.copy()
+
+    unavailable_stations = set()
+    effective_rate_factor = 1.0
+
+    if scenario == "Urgent Tasking":
+        # Give one task higher importance and an earlier deadline.
+        mask = adjusted_tasks["task_id"] == "T07"
+        adjusted_tasks.loc[mask, "priority"] = 15
+        adjusted_tasks.loc[mask, "deadline"] = 75
+
+    elif scenario == "Ground Station Outage":
+        unavailable_stations.add(outage_station)
+
+    elif scenario == "Link Degradation":
+        effective_rate_factor = rate_factor
+
+    elif scenario == "Multiple Events":
+        # IMPORTANT: both disruptions are active simultaneously.
+        unavailable_stations.add(outage_station)
+        effective_rate_factor = rate_factor
+
+    adjusted_passes["effective_rate"] = (
+        adjusted_passes["rate"] * effective_rate_factor
+    )
+
+    # A pass at an unavailable station cannot be used.
+    adjusted_passes["available"] = ~adjusted_passes["station"].isin(
+        unavailable_stations
+    )
+
+    return adjusted_passes, adjusted_tasks, unavailable_stations
 
 
-# ---------------- OPTIMIZER ----------------
+# ============================================================
+# CANDIDATE GENERATION
+# Each candidate is one compatible task/pass pair.
+# Transmission duration is rounded up to whole minutes.
+# ============================================================
 
-def optimize_mission(scenario, outage_station, quality_factor):
-    model = cp_model.CpModel()
+def generate_candidates(passes, tasks):
     candidates = []
-    task_choices = {t[0]: [] for t in TASKS}
-    sat_intervals = {s: [] for s in SATELLITES}
-    station_intervals = {s: [] for s in STATIONS}
-    power_terms = {s: [] for s in SATELLITES}
-    storage_items = {s: [] for s in SATELLITES}
 
-    # Apply the selected scenario to actual visibility passes.
-    usable_passes = []
-    for pid, sat, station, ps, pe, quality in PASSES:
-        if scenario == "Ground Station Outage" and station == outage_station:
-            continue
-
-        if scenario == "Link Degradation":
-            quality *= quality_factor
-
-        rate = STATIONS[station] * quality
-        usable_passes.append({
-            "id": pid, "sat": sat, "station": station,
-            "start": ps, "end": pe, "quality": quality, "rate": rate
-        })
-
-    for task in TASKS:
-        tid, kind, priority, duration, data, deadline, power = task
-
-        for sat, sd in SATELLITES.items():
-            if kind not in sd["capabilities"]:
+    for task in tasks.itertuples(index=False):
+        for p in passes.itertuples(index=False):
+            if not p.available:
                 continue
 
-            for p in usable_passes:
-                if p["sat"] != sat:
-                    continue
+            if task.satellite != p.satellite:
+                continue
 
-                tx_duration = max(
-                    1, math.ceil(data * 8 / (p["rate"] * 60))
-                )
+            if p.effective_rate <= 0:
+                continue
 
-                if p["start"] + tx_duration > p["end"]:
-                    continue
+            duration = max(
+                1,
+                math.ceil(task.data_mb / p.effective_rate),
+            )
 
-                if p["start"] + tx_duration > deadline:
-                    continue
+            latest_end = min(int(p.end), int(task.deadline))
 
-                i = len(candidates)
-                chosen = model.NewBoolVar(f"chosen_{i}")
+            if int(p.start) + duration > latest_end:
+                continue
 
-                start = model.NewIntVar(0, deadline - duration, f"start_{i}")
-                end = model.NewIntVar(duration, deadline, f"end_{i}")
-                model.Add(end == start + duration)
+            candidates.append({
+                "task_id": task.task_id,
+                "satellite": task.satellite,
+                "priority": int(task.priority),
+                "deadline": int(task.deadline),
+                "data_mb": int(task.data_mb),
+                "pass_id": p.pass_id,
+                "station": p.station,
+                "pass_start": int(p.start),
+                "pass_end": int(p.end),
+                "rate": float(p.effective_rate),
+                "duration": int(duration),
+                "latest_start": latest_end - duration,
+            })
 
-                tx_start = model.NewIntVar(
-                    p["start"], p["end"] - tx_duration, f"txstart_{i}"
-                )
-                tx_end = model.NewIntVar(
-                    p["start"] + tx_duration, p["end"], f"txend_{i}"
-                )
-                model.Add(tx_end == tx_start + tx_duration)
-                model.Add(end <= tx_start).OnlyEnforceIf(chosen)
+    return candidates
 
-                exec_interval = model.NewOptionalIntervalVar(
-                    start, duration, end, chosen, f"exec_{i}"
-                )
-                tx_interval = model.NewOptionalIntervalVar(
-                    tx_start, tx_duration, tx_end, chosen, f"tx_{i}"
-                )
 
-                sat_intervals[sat] += [exec_interval, tx_interval]
-                station_intervals[p["station"]].append(tx_interval)
-                power_terms[sat].append(chosen * power)
-                task_choices[tid].append(chosen)
+# ============================================================
+# CP-SAT OPTIMIZER
+# Every candidate has an optional interval.
+# A task can be scheduled at most once.
+# Stations and satellites cannot have overlapping transmissions.
+# ============================================================
 
-                # Storage is occupied between task completion and downlink.
-                stored_duration = model.NewIntVar(
-                    0, deadline, f"stored_duration_{i}"
-                )
-                model.Add(stored_duration == tx_end - end).OnlyEnforceIf(chosen)
+def optimize_cpsat(candidates, tasks, time_limit=10):
+    if not candidates:
+        return pd.DataFrame(), "NO_CANDIDATES", 0.0
 
-                stored_interval = model.NewOptionalIntervalVar(
-                    end, stored_duration, tx_end, chosen, f"storage_{i}"
-                )
-                storage_items[sat].append((stored_interval, data))
+    model = cp_model.CpModel()
 
-                candidates.append({
-                    "chosen": chosen, "task": task, "sat": sat,
-                    "pass": p, "start": start, "end": end,
-                    "tx_start": tx_start, "tx_end": tx_end,
-                    "tx_duration": tx_duration
-                })
+    selected = {}
+    intervals = {}
+    starts = {}
 
-    for choices in task_choices.values():
-        if choices:
-            model.Add(sum(choices) <= 1)
+    by_task = defaultdict(list)
+    by_station = defaultdict(list)
+    by_satellite = defaultdict(list)
 
-    for sat, sd in SATELLITES.items():
-        if sat_intervals[sat]:
-            model.AddNoOverlap(sat_intervals[sat])
+    for i, c in enumerate(candidates):
+        key = i
 
-        if power_terms[sat]:
-            model.Add(sum(power_terms[sat]) <= sd["power"])
+        selected[key] = model.NewBoolVar(f"selected_{i}")
 
-        # Reserve initial occupied storage for the entire planning horizon.
-        baseline = model.NewIntervalVar(0, 65, 65, f"initial_{sat}")
-        intervals = [baseline]
-        demands = [sd["initial"]]
+        starts[key] = model.NewIntVar(
+            c["pass_start"],
+            c["latest_start"],
+            f"start_{i}",
+        )
 
-        for interval, data in storage_items[sat]:
-            intervals.append(interval)
-            demands.append(data)
+        intervals[key] = model.NewOptionalIntervalVar(
+            starts[key],
+            c["duration"],
+            starts[key] + c["duration"],
+            selected[key],
+            f"interval_{i}",
+        )
 
-        model.AddCumulative(intervals, demands, sd["storage"])
+        by_task[c["task_id"]].append(selected[key])
+        by_station[c["station"]].append(intervals[key])
+        by_satellite[c["satellite"]].append(intervals[key])
 
-    for station, intervals in station_intervals.items():
-        if intervals:
-            model.AddNoOverlap(intervals)
+    # A task can be assigned to at most one pass.
+    for task_id, variables in by_task.items():
+        model.Add(sum(variables) <= 1)
 
-    model.Maximize(sum(
-        c["chosen"] * (c["task"][2] * 100 + 1)
-        for c in candidates
-    ))
+    # No overlapping transmissions on the same station or satellite.
+    for station, station_intervals in by_station.items():
+        model.AddNoOverlap(station_intervals)
+
+    for satellite, satellite_intervals in by_satellite.items():
+        model.AddNoOverlap(satellite_intervals)
+
+    # Maximize the total selected task priority.
+    priority_by_task = {
+        row.task_id: int(row.priority)
+        for row in tasks.itertuples(index=False)
+    }
+
+    model.Maximize(
+        sum(
+            priority_by_task[c["task_id"]] * selected[i]
+            for i, c in enumerate(candidates)
+        )
+    )
 
     solver = cp_model.CpSolver()
-    solver.parameters.max_time_in_seconds = 15
-    status = solver.Solve(model)
+    solver.parameters.max_time_in_seconds = float(time_limit)
+    solver.parameters.num_search_workers = 8
 
-    if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        return solver.StatusName(status), pd.DataFrame(), 0, len(candidates)
+    start_time = time.perf_counter()
+    status_code = solver.Solve(model)
+    runtime = time.perf_counter() - start_time
 
-    rows = []
-    for c in candidates:
-        if solver.Value(c["chosen"]) == 0:
-            continue
+    status = solver.StatusName(status_code)
 
-        t, p = c["task"], c["pass"]
-        rows.append({
-            "Task": t[0], "Type": t[1], "Priority": t[2],
-            "Satellite": c["sat"], "Station": p["station"],
-            "Pass": p["id"],
-            "Start": solver.Value(c["start"]),
-            "End": solver.Value(c["end"]),
-            "Downlink Start": solver.Value(c["tx_start"]),
-            "Downlink End": solver.Value(c["tx_end"]),
-            "Data MB": t[4], "Link Quality": round(p["quality"], 2)
-        })
+    if status_code not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        return pd.DataFrame(), status, runtime
 
-    result = pd.DataFrame(rows)
-    if not result.empty:
-        result = result.sort_values("Start").reset_index(drop=True)
+    result = []
 
-    utility = int(result["Priority"].sum()) if not result.empty else 0
-    return solver.StatusName(status), result, utility, len(candidates)
+    for i, c in enumerate(candidates):
+        if solver.Value(selected[i]):
+            row = c.copy()
+            row["start"] = int(solver.Value(starts[i]))
+            row["end"] = row["start"] + row["duration"]
+            row["status"] = "Scheduled"
+            result.append(row)
+
+    return pd.DataFrame(result), status, runtime
 
 
-# ---------------- STREAMLIT INTERFACE ----------------
+# ============================================================
+# GREEDY BASELINE
+# Process higher-priority tasks first, then earlier deadlines.
+# For each task, find the earliest non-conflicting feasible slot.
+# ============================================================
 
-st.title("🛰️ Intelligent Satellite Mission Control")
-st.caption("Constraint-based scheduling prototype using simulated orbital passes")
+def run_greedy(candidates, tasks):
+    if not candidates:
+        return pd.DataFrame()
 
-scenario = st.sidebar.selectbox(
-    "Mission scenario",
-    ["Normal Mission", "Ground Station Outage", "Link Degradation"]
+    task_order = tasks.sort_values(
+        ["priority", "deadline"],
+        ascending=[False, True],
+    )
+
+    selected_rows = []
+    used_tasks = set()
+
+    station_intervals = defaultdict(list)
+    satellite_intervals = defaultdict(list)
+
+    def conflicts(existing, start, end):
+        return any(
+            start < old_end and end > old_start
+            for old_start, old_end in existing
+        )
+
+    for task in task_order.itertuples(index=False):
+        options = [
+            c for c in candidates
+            if c["task_id"] == task.task_id
+        ]
+
+        options.sort(key=lambda c: (c["pass_start"], c["duration"]))
+
+        for c in options:
+            if c["task_id"] in used_tasks:
+                continue
+
+            # Search for the earliest valid minute in this pass.
+            assigned = False
+
+            for start in range(
+                c["pass_start"],
+                c["latest_start"] + 1,
+            ):
+                end = start + c["duration"]
+
+                if conflicts(station_intervals[c["station"]], start, end):
+                    continue
+
+                if conflicts(
+                    satellite_intervals[c["satellite"]], start, end
+                ):
+                    continue
+
+                row = c.copy()
+                row["start"] = start
+                row["end"] = end
+                row["status"] = "Scheduled"
+
+                selected_rows.append(row)
+                used_tasks.add(c["task_id"])
+
+                station_intervals[c["station"]].append((start, end))
+                satellite_intervals[c["satellite"]].append((start, end))
+
+                assigned = True
+                break
+
+            if assigned:
+                break
+
+    return pd.DataFrame(selected_rows)
+
+
+# ============================================================
+# VALIDATION
+# Check deadline, pass window, station outage, rate duration,
+# task uniqueness, and resource overlaps.
+# ============================================================
+
+def validate_schedule(schedule, passes, tasks, unavailable_stations):
+    issues = []
+
+    if schedule.empty:
+        return ["No tasks scheduled."]
+
+    if schedule["task_id"].duplicated().any():
+        issues.append("A task was scheduled more than once.")
+
+    task_lookup = tasks.set_index("task_id").to_dict("index")
+    pass_lookup = passes.set_index("pass_id").to_dict("index")
+
+    for row in schedule.itertuples(index=False):
+        p = pass_lookup[row.pass_id]
+        task = task_lookup[row.task_id]
+
+        if row.station in unavailable_stations:
+            issues.append(
+                f"{row.task_id}: assigned to unavailable station {row.station}."
+            )
+
+        if row.start < p["start"] or row.end > p["end"]:
+            issues.append(
+                f"{row.task_id}: transmission lies outside its pass window."
+            )
+
+        if row.end > task["deadline"]:
+            issues.append(f"{row.task_id}: deadline violated.")
+
+        if row.duration != max(
+            1, math.ceil(task["data_mb"] / p["effective_rate"])
+        ):
+            issues.append(
+                f"{row.task_id}: duration does not match the modeled rate."
+            )
+
+    for resource in ["station", "satellite"]:
+        for resource_name, group in schedule.groupby(resource):
+            group = group.sort_values("start")
+            previous_end = None
+
+            for row in group.itertuples(index=False):
+                if previous_end is not None and row.start < previous_end:
+                    issues.append(
+                        f"{resource} {resource_name}: overlapping transmissions."
+                    )
+                    break
+                previous_end = max(
+                    previous_end or row.end,
+                    row.end,
+                )
+
+    return issues
+
+
+# ============================================================
+# METRICS
+# ============================================================
+
+def summarize(schedule, tasks, runtime=None, solver_status=None):
+    if schedule.empty:
+        return {
+            "Tasks scheduled": 0,
+            "Priority utility": 0,
+            "Unscheduled tasks": len(tasks),
+            "Runtime (seconds)": runtime,
+            "Solver status": solver_status or "Not applicable",
+        }
+
+    return {
+        "Tasks scheduled": int(schedule["task_id"].nunique()),
+        "Priority utility": int(schedule["priority"].sum()),
+        "Unscheduled tasks": int(
+            len(tasks) - schedule["task_id"].nunique()
+        ),
+        "Runtime (seconds)": (
+            round(runtime, 4) if runtime is not None else None
+        ),
+        "Solver status": solver_status or "Not applicable",
+    }
+
+
+# ============================================================
+# STREAMLIT CONTROLS
+# ============================================================
+
+with st.sidebar:
+    st.header("Scenario controls")
+
+    scenario = st.selectbox(
+        "Select stress-test scenario",
+        SCENARIOS,
+        index=0,
+    )
+
+    outage_station = st.selectbox(
+        "Station affected by outage",
+        ["GS-A", "GS-B", "GS-C"],
+        index=2,
+        help="Used by Ground Station Outage and Multiple Events.",
+    )
+
+    rate_factor = st.slider(
+        "Remaining link-rate multiplier",
+        min_value=0.20,
+        max_value=1.00,
+        value=0.55,
+        step=0.05,
+        help="0.55 means 55% of the original rate, or a 45% reduction.",
+    )
+
+    time_limit = st.slider(
+        "CP-SAT time limit (seconds)",
+        min_value=1,
+        max_value=30,
+        value=10,
+    )
+
+    st.info(
+        "Multiple Events activates both the selected station outage "
+        "and reduced link rate in one run."
+    )
+
+
+# ============================================================
+# RUN THE APPLICATION
+# ============================================================
+
+satellites, stations, base_passes, base_tasks = create_data()
+
+passes, tasks, unavailable_stations = apply_scenario(
+    base_passes,
+    base_tasks,
+    scenario,
+    outage_station,
+    rate_factor,
 )
 
-outage_station = "GS-01"
-quality_factor = 0.5
+candidates = generate_candidates(passes, tasks)
 
-if scenario == "Ground Station Outage":
-    outage_station = st.sidebar.selectbox(
-        "Unavailable station", list(STATIONS.keys())
+st.subheader("1. Scenario configuration")
+
+col1, col2, col3 = st.columns(3)
+
+with col1:
+    st.metric("Satellites", len(satellites))
+
+with col2:
+    st.metric("Ground stations", len(stations))
+
+with col3:
+    st.metric("Candidate assignments", len(candidates))
+
+st.write(f"**Selected scenario:** {scenario}")
+
+if scenario in ("Ground Station Outage", "Multiple Events"):
+    st.warning(
+        f"Station outage active: {', '.join(sorted(unavailable_stations))}"
     )
 
-if scenario == "Link Degradation":
-    quality_factor = st.sidebar.slider(
-        "Link quality multiplier", 0.1, 0.9, 0.5, 0.1
+if scenario in ("Link Degradation", "Multiple Events"):
+    st.warning(
+        f"Link degradation active: {rate_factor:.0%} of original data rate."
     )
 
-if st.sidebar.button("Run optimizer", type="primary"):
-    with st.spinner("Solving the scheduling problem..."):
-        status, result, utility, candidate_count = optimize_mission(
-            scenario, outage_station, quality_factor
+st.subheader("2. Input data")
+
+with st.expander("View tasks"):
+    st.dataframe(tasks, use_container_width=True)
+
+with st.expander("View communication passes"):
+    st.dataframe(passes, use_container_width=True)
+
+st.subheader("3. Run schedulers")
+
+if st.button("🚀 Run Greedy and CP-SAT benchmark", type="primary"):
+    with st.spinner("Solving scheduling problem..."):
+        greedy_start = time.perf_counter()
+        greedy_schedule = run_greedy(candidates, tasks)
+        greedy_runtime = time.perf_counter() - greedy_start
+
+        cpsat_schedule, solver_status, cpsat_runtime = optimize_cpsat(
+            candidates,
+            tasks,
+            time_limit=time_limit,
         )
 
-    st.session_state["result"] = result
-    st.session_state["status"] = status
-    st.session_state["utility"] = utility
-    st.session_state["candidate_count"] = candidate_count
-    st.session_state["scenario"] = scenario
-    st.session_state["station"] = outage_station
-    st.session_state["factor"] = quality_factor
+        st.session_state["run_results"] = {
+            "scenario": scenario,
+            "passes": passes,
+            "tasks": tasks,
+            "unavailable_stations": unavailable_stations,
+            "greedy_schedule": greedy_schedule,
+            "cpsat_schedule": cpsat_schedule,
+            "greedy_runtime": greedy_runtime,
+            "cpsat_runtime": cpsat_runtime,
+            "solver_status": solver_status,
+        }
 
-if "result" not in st.session_state:
-    with st.spinner("Running initial mission optimization..."):
-        status, result, utility, candidate_count = optimize_mission(
-            "Normal Mission", outage_station, quality_factor
-        )
-    st.session_state.update({
-        "result": result, "status": status, "utility": utility,
-        "candidate_count": candidate_count,
-        "scenario": "Normal Mission",
-        "station": outage_station, "factor": quality_factor
-    })
 
-result = st.session_state["result"]
-status = st.session_state["status"]
-utility = st.session_state["utility"]
+# Keep the latest run visible after Streamlit reruns.
+if "run_results" not in st.session_state:
+    st.info("Select a scenario, then click **Run Greedy and CP-SAT benchmark**.")
+    st.stop()
 
-if st.session_state["scenario"] != scenario:
-    st.warning("Scenario changed. Click Run optimizer to calculate the new schedule.")
+results = st.session_state["run_results"]
 
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Scheduled Tasks", len(result), f"of {len(TASKS)}")
-c2.metric("Unscheduled Tasks", len(TASKS) - len(result))
-c3.metric("Mission Utility", utility)
-c4.metric("Solver Status", status)
+if results["scenario"] != scenario:
+    st.warning(
+        "The scenario controls changed since the last run. "
+        "Click the benchmark button again to calculate updated results."
+    )
+    st.stop()
+
+greedy_schedule = results["greedy_schedule"]
+cpsat_schedule = results["cpsat_schedule"]
+tasks = results["tasks"]
+passes = results["passes"]
+unavailable_stations = results["unavailable_stations"]
+
+st.subheader("4. Benchmark results")
+
+greedy_metrics = summarize(
+    greedy_schedule,
+    tasks,
+    runtime=results["greedy_runtime"],
+    solver_status="Greedy heuristic",
+)
+
+cpsat_metrics = summarize(
+    cpsat_schedule,
+    tasks,
+    runtime=results["cpsat_runtime"],
+    solver_status=results["solver_status"],
+)
+
+comparison = pd.DataFrame(
+    [
+        {"Method": "Greedy", **greedy_metrics},
+        {"Method": "CP-SAT", **cpsat_metrics},
+    ]
+).set_index("Method")
+
+st.dataframe(comparison, use_container_width=True)
+
+base_utility = greedy_metrics["Priority utility"]
+optimized_utility = cpsat_metrics["Priority utility"]
+
+if base_utility > 0:
+    improvement = (
+        (optimized_utility - base_utility) / base_utility
+    ) * 100
+    st.metric(
+        "CP-SAT priority-utility change vs. Greedy",
+        f"{improvement:+.1f}%",
+    )
+else:
+    st.caption(
+        "Percentage change is unavailable because Greedy utility is zero."
+    )
 
 st.caption(
-    f"Candidate combinations evaluated: {st.session_state['candidate_count']}"
+    "Priority utility is the sum of the selected tasks' priority values. "
+    "It is a modeled score, not real-world satellite throughput."
 )
 
-if scenario == "Ground Station Outage":
-    st.warning(f"{outage_station} is removed from the candidate visibility passes.")
-elif scenario == "Link Degradation":
+st.subheader("5. Schedule validation")
+
+for method_name, schedule in [
+    ("Greedy", greedy_schedule),
+    ("CP-SAT", cpsat_schedule),
+]:
+    issues = validate_schedule(
+        schedule,
+        passes,
+        tasks,
+        unavailable_stations,
+    )
+
+    with st.expander(f"{method_name} validation"):
+        if not issues:
+            st.success("All implemented validation checks passed.")
+        else:
+            st.error(f"{len(issues)} validation issue(s) found.")
+            for issue in issues:
+                st.write(f"- {issue}")
+
+st.subheader("6. Optimized schedule")
+
+if cpsat_schedule.empty:
     st.warning(
-        f"Effective link quality is multiplied by {quality_factor:.1f}. "
-        "Reduced rates can make some downlinks infeasible."
+        f"CP-SAT returned no schedule. Solver status: "
+        f"{results['solver_status']}"
     )
-
-if result.empty:
-    st.info("No feasible tasks were selected for this scenario.")
 else:
-    st.subheader("Satellite Task Timeline")
+    display_columns = [
+        "task_id",
+        "satellite",
+        "station",
+        "pass_id",
+        "start",
+        "end",
+        "duration",
+        "priority",
+        "deadline",
+        "data_mb",
+        "rate",
+    ]
 
-    # Numeric bar chart: avoids Plotly interpreting minutes as timestamps.
-    task_plot = result.copy()
-    task_plot["Duration"] = task_plot["End"] - task_plot["Start"]
+    st.dataframe(
+        cpsat_schedule[display_columns].sort_values("start"),
+        use_container_width=True,
+    )
 
-    fig = px.bar(
-        task_plot,
-        x="Duration",
-        y="Satellite",
-        base="Start",
-        color="Type",
-        orientation="h",
-        hover_data=["Task", "Priority", "Station", "Start", "End"]
+    chart_df = cpsat_schedule.copy()
+    chart_df["Task"] = (
+        chart_df["task_id"] + " | " + chart_df["station"]
     )
-    fig.update_layout(
-        xaxis_title="Mission time (minutes)",
-        yaxis_title="Satellite",
-        xaxis_type="linear"
+
+    fig = px.timeline(
+        chart_df,
+        x_start="start",
+        x_end="end",
+        y="station",
+        color="satellite",
+        hover_data=[
+            "task_id",
+            "pass_id",
+            "priority",
+            "deadline",
+            "duration",
+            "rate",
+        ],
+        title="CP-SAT transmission schedule",
     )
+
+    fig.update_yaxes(autorange="reversed", title="Ground station")
+    fig.update_xaxes(title="Mission time (minutes)")
+    fig.update_layout(legend_title="Satellite")
+
     st.plotly_chart(fig, use_container_width=True)
 
-    st.subheader("Ground-Station Downlink Schedule")
-    downlink_plot = result.copy()
-    downlink_plot["Transmission Duration"] = (
-        downlink_plot["Downlink End"] - downlink_plot["Downlink Start"]
+st.subheader("7. Download results")
+
+col1, col2 = st.columns(2)
+
+with col1:
+    st.download_button(
+        "Download CP-SAT schedule CSV",
+        data=cpsat_schedule.to_csv(index=False).encode("utf-8"),
+        file_name=f"cpsat_schedule_{scenario.lower().replace(' ', '_')}.csv",
+        mime="text/csv",
     )
 
-    fig2 = px.bar(
-        downlink_plot,
-        x="Transmission Duration",
-        y="Station",
-        base="Downlink Start",
-        color="Satellite",
-        orientation="h",
-        hover_data=["Task", "Pass", "Link Quality"]
+with col2:
+    st.download_button(
+        "Download Greedy schedule CSV",
+        data=greedy_schedule.to_csv(index=False).encode("utf-8"),
+        file_name=f"greedy_schedule_{scenario.lower().replace(' ', '_')}.csv",
+        mime="text/csv",
     )
-    fig2.update_layout(
-        xaxis_title="Mission time (minutes)",
-        yaxis_title="Ground station",
-        xaxis_type="linear"
-    )
-    st.plotly_chart(fig2, use_container_width=True)
 
-    st.subheader("Optimized Schedule")
-    st.dataframe(result, use_container_width=True)
-
-    skipped = sorted(set(t[0] for t in TASKS) - set(result["Task"]))
-    st.write("Unscheduled tasks:", ", ".join(skipped) if skipped else "None")
-
-    # Basic consistency checks on the displayed schedule.
-    st.subheader("Schedule Validation")
-    checks = []
-
-    checks.append((
-        "No downlinks use failed station",
-        scenario != "Ground Station Outage"
-        or not (result["Station"] == outage_station).any()
-    ))
-
-    checks.append((
-        "No downlink exceeds its visibility pass",
-        all(
-            row["Downlink Start"] >= next(
-                p[3] for p in PASSES if p[0] == row["Pass"]
-            )
-            and row["Downlink End"] <= next(
-                p[4] for p in PASSES if p[0] == row["Pass"]
-            )
-            for _, row in result.iterrows()
-        )
-    ))
-
-    checks.append((
-        "Task completes before downlink",
-        (result["End"] <= result["Downlink Start"]).all()
-    ))
-
-    checks.append((
-        "No station transmission overlaps",
-        all(
-            all(
-                a["Downlink End"] <= b["Downlink Start"]
-                or b["Downlink End"] <= a["Downlink Start"]
-                for i, a in enumerate(group.to_dict("records"))
-                for b in group.to_dict("records")[i+1:]
-            )
-            for _, group in result.groupby("Station")
-        )
-    ))
-
-    for label, passed in checks:
-        st.write(("✅ " if passed else "❌ ") + label)
-
+st.divider()
 st.caption(
-    "Synthetic research prototype, not connected to live satellite telemetry. "
-    "Power and storage use simplified planning constraints."
+    "Prototype limitation: the data, visibility windows, and communication "
+    "rates are simulated. This application does not control or communicate "
+    "with real satellites."
 )
